@@ -42,6 +42,7 @@ from .call_receiver_typing import (
 )
 from .language_data import (
     get_builtin_methods,
+    get_builtin_types,
     get_external_receiver_types,
     get_external_return_types,
 )
@@ -130,7 +131,7 @@ def _is_property_accessor(sym: Any) -> bool:
 
 # Languages admitted to the full return-type chain lane; each is admitted
 # explicitly, once measured.
-PRODUCTION_RETURN_TYPE_CHAIN_LANGUAGES: frozenset[str] = frozenset({"cpp", "go"})
+PRODUCTION_RETURN_TYPE_CHAIN_LANGUAGES: frozenset[str] = frozenset({"cpp", "csharp", "go"})
 
 # Chain lanes that need a file or import/re-export identity for the head type:
 # a repository-global simple type name is not a language binding.
@@ -344,6 +345,11 @@ class CallResolver(LanguageStrategiesMixin, ReceiverTypingMixin):
 
         self._init_receiver_typing_caches()
         self._repo_rebound_names: dict[str, frozenset[str]] = {}
+        # {file: {(line, receiver, target): the call it is chained onto}}, and
+        # the chain links being typed right now, which a cycle would revisit.
+        self._chained_sites: dict[str, dict[tuple[int, str | None, str], CallReceiver]] = {}
+        self._chain_links_in_flight: set[tuple[str, int, str | None, str]] = set()
+        self._unindexed_extensions: frozenset[str] | None = None
 
         # Barrel re-export origins: {barrel_file: {name: origin_file}}
         self._barrel_origins: dict[str, dict[str, str]] = defaultdict(dict)
@@ -926,6 +932,8 @@ class CallResolver(LanguageStrategiesMixin, ReceiverTypingMixin):
             return False, None
 
         found = self._typed_receiver_target(file_path, call, caller_id, type_name)
+        if found is None and language == "csharp":
+            return self._csharp_chain_member(file_path, call, caller_id, type_name)
         if language == "cpp" and not _admitted_cpp_chain(type_name, call.target_name):
             # C++ admits only ``future.get()``; broader return-name matching
             # is not admitted.
@@ -951,6 +959,80 @@ class CallResolver(LanguageStrategiesMixin, ReceiverTypingMixin):
         if language in ("csharp", "typescript"):
             return False
         return type_name in self._known_type_names
+
+    def _csharp_chain_member(
+        self,
+        file_path: str,
+        call: CallSite,
+        caller_id: str,
+        type_name: str,
+    ) -> tuple[bool, ResolvedCall | None]:
+        """The member a C# chain reaches on a head type that does not declare it.
+
+        C# binds an instance method, an inherited one included, before an
+        extension, and an extension on a base type serves every type deriving
+        from it. Ancestors on two branches answering is ambiguous, and refused.
+
+        With no answer the bare-name fallback is disproved for a known type,
+        unless an extension the index leaves out carries the name: one on a
+        type parameter (``this TBuilder b``) or an external type may be it.
+        """
+        type_id = self._csharp_type_id(type_name)
+        if type_id is not None:
+            inherited = self._ancestor_method(type_id, call.target_name, caller_id)
+            if inherited is not None:
+                same_file = self._symbol_paths_by_id.get(inherited) == file_path
+                tier = "same_file" if same_file else "import"
+                return True, self._return_typed_call(caller_id, inherited, tier, call.line)
+
+        own = self._typed_extension_call(file_path, call, caller_id, type_name, "csharp")
+        if own is not None:
+            return True, own
+        ancestor_names = [
+            symbol.name
+            for ancestor in (self._ancestors_of(type_id) if type_id is not None else ())
+            if (symbol := self._symbols_by_id.get(ancestor)) is not None
+        ]
+        hits = {}
+        for name in ancestor_names:
+            hit = self._typed_extension_call(file_path, call, caller_id, name, "csharp")
+            if hit is not None:
+                hits[hit.callee_id] = hit
+        if hits:
+            return True, next(iter(hits.values())) if len(hits) == 1 else None
+        # Proven only for a type whose members were all asked: a name the
+        # repository does not declare may be a type parameter (``TBuilder``),
+        # whose members are its constraint's.
+        known = type_id is not None or id_segment_name(type_name) in get_builtin_types("csharp")
+        return known and call.target_name not in self._unindexed_extension_names(), None
+
+    def _csharp_type_id(self, type_name: str) -> str | None:
+        """The one C# type *type_name* (``IFoo`1`` or ``IFoo``) names repo-wide, or None."""
+        bare, _, arity = type_name.partition("`")
+        candidates = [
+            symbol
+            for sym_id in self._global_symbols.get(bare, ())
+            if (symbol := self._symbols_by_id[sym_id]).kind in _TYPE_KINDS
+            and symbol.language == "csharp"
+            and (symbol.type_parameter_count or 0) == int(arity or 0)
+        ]
+        return candidates[0].id if len(candidates) == 1 else None
+
+    def _unindexed_extension_names(self) -> frozenset[str]:
+        """Names of C# extension methods the extension index leaves out; built once.
+
+        Those extend a type parameter or an external type, so no typed lookup
+        can reach them and only the bare name still can.
+        """
+        if self._unindexed_extensions is None:
+            self._unindexed_extensions = frozenset(
+                sym.name
+                for sym in self._symbols_by_id.values()
+                if sym.language == "csharp"
+                and csharp_extension_receiver(sym.signature)
+                and self._csharp_extended_type(sym) is None
+            )
+        return self._unindexed_extensions
 
     def _external_chain_return_type(
         self,
@@ -994,17 +1076,53 @@ class CallResolver(LanguageStrategiesMixin, ReceiverTypingMixin):
             # Admitted by its table alone; inferring from repository return
             # types is not admitted for this language.
             return None
+        link = (file_path, call.line, inner.receiver_name, inner.target_name)
+        if link in self._chain_links_in_flight:
+            return None
         inner_call = CallSite(
             target_name=inner.target_name,
             receiver_name=inner.receiver_name,
             caller_symbol_id=caller_id,
             line=call.line,
             argument_count=inner.argument_count,
+            receiver_call=self._nested_receiver_call(file_path, call.line, inner, language),
         )
-        resolved_inner = self._resolve_one(file_path, inner_call)
+        self._chain_links_in_flight.add(link)
+        try:
+            resolved_inner = self._resolve_one(file_path, inner_call)
+        finally:
+            self._chain_links_in_flight.discard(link)
         if resolved_inner is None:
             return None
-        return self._callee_return_type(resolved_inner.callee_id, inner.argument_count, language)
+        # The overload the inner call's arguments select is the one whose type it returns.
+        callee_id = resolved_inner.callee_id
+        rep = self._overload_rep.get(callee_id)
+        if rep is not None:
+            callee_id = self._pick_overload(rep, inner.argument_count) or callee_id
+        return self._callee_return_type(callee_id, inner.argument_count, language)
+
+    def _nested_receiver_call(
+        self, file_path: str, line: int, inner: CallReceiver, language: str
+    ) -> CallReceiver | None:
+        """The call *inner* is itself chained onto: ``a()`` under ``a().b().c()``.
+
+        A receiver records one hop, but the parser keeps every link of a chain
+        as its own site on the chain's first line, so the hop below is read
+        off the site *inner* names. Only C# reads it; elsewhere an inner call
+        is still typed as if nothing were chained under it.
+        """
+        if language != "csharp":
+            return None
+        sites = self._chained_sites.get(file_path)
+        if sites is None:
+            parsed = self._parsed_files.get(file_path)
+            sites = {
+                (c.line, c.receiver_name, c.target_name): c.receiver_call
+                for c in (parsed.calls if parsed else ())
+                if c.receiver_call is not None
+            }
+            _store_capped(self._chained_sites, file_path, sites, _SOURCE_CACHE_FILES)
+        return sites.get((line, inner.receiver_name, inner.target_name))
 
     def _callee_return_type(
         self, callee_id: str, argument_count: int | None, language: str
@@ -1635,6 +1753,10 @@ class CallResolver(LanguageStrategiesMixin, ReceiverTypingMixin):
         # recursion; an ancestor's declaration of the name is not the target.
         if self._declares(class_id, method_name) is not None:
             return None
+        return self._ancestor_method(class_id, method_name, caller_id)
+
+    def _ancestor_method(self, class_id: str, method_name: str, caller_id: str) -> str | None:
+        """The one method of this name *class_id*'s ancestors declare, never the caller."""
         hits = set()
         for ancestor in self._ancestors_of(class_id):
             sym_id = self._declares(ancestor, method_name)
