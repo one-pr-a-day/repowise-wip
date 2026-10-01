@@ -92,6 +92,12 @@ _INHERITED_LANGUAGES = frozenset({"kotlin", "python", "typescript", "swift", "cs
 # repo-wide uniqueness is no evidence and only wildcard imports may merge names.
 _LEXICAL_BARE_NAME_LANGUAGES = frozenset({"elixir", "fsharp"})
 
+# Languages whose imports name what they bring into scope, so only wildcard
+# imports may merge an imported file's names: ``use a::{B, C}`` binds B and C,
+# never the rest of ``a``. Rust is not lexical above: its receiver-less call
+# sites are mostly chained method calls, which repo-wide uniqueness still serves.
+_NAMED_IMPORT_SCOPE_LANGUAGES = _LEXICAL_BARE_NAME_LANGUAGES | {"rust"}
+
 # The sentinel an import that binds a whole module's public names carries.
 _WILDCARD_IMPORTED_NAMES = ["*"]
 
@@ -775,11 +781,11 @@ class CallResolver(LanguageStrategiesMixin, ReceiverTypingMixin):
         Every language but the lexically-scoped ones can use its whole import
         set: a name reaching this tier arrived through some import, and which
         directive carried it is not knowable from the resolved file alone. For
-        a language in ``_LEXICAL_BARE_NAME_LANGUAGES`` it is knowable and it
+        a language in ``_NAMED_IMPORT_SCOPE_LANGUAGES`` it is knowable and it
         matters, so only imports that bind a whole module's public names count.
         """
         targets = self._import_targets.get(file_path, set())
-        if self._language_of(file_path) not in _LEXICAL_BARE_NAME_LANGUAGES:
+        if self._language_of(file_path) not in _NAMED_IMPORT_SCOPE_LANGUAGES:
             return targets
         parsed = self._parsed_files.get(file_path)
         if parsed is None:

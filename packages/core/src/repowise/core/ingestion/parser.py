@@ -996,6 +996,8 @@ def _statement_imports(
         return _php_imports(stmt_node, raw, src)
     if language == "dart":
         return [_dart_import(stmt_node, module_node, module_text, raw, src)]
+    if language == "rust" and stmt_node.type == "use_declaration":
+        return _rust_use_imports(stmt_node, module_text, raw, src)
     if language in _TS_JS_LANGUAGES and _is_dynamic_esm_import(stmt_node):
         # ``import('./mod')`` binds a module namespace at runtime, so it is a
         # wildcard, which keeps the target's exports live.
@@ -1155,6 +1157,70 @@ def _generic_import(
         bindings=bindings,
         is_reexport=_is_reexport_import(stmt_node, raw, language),
     )
+
+
+def _rust_use_imports(stmt_node: Node, module_text: str, raw: str, src: str) -> list[Import]:
+    """Rust: one Import per leaf of the use tree, each with its own path.
+
+    ``use crate::{a::B, c::D}`` names two modules, and the joined string
+    resolves to neither. ``super`` hops that only climb out of inline
+    ``mod`` blocks stay inside this file, so they are dropped here and the
+    resolver sees the path the file itself would write.
+    """
+    from .extractors.bindings.rust import expand_rust_use_tree, rust_use_argument
+    from .models import NamedBinding
+
+    arg_node = rust_use_argument(stmt_node)
+    leaves = expand_rust_use_tree(arg_node, src) if arg_node is not None else []
+    inline_depth = _rust_inline_mod_depth(stmt_node)
+    is_reexport = _is_reexport_import(stmt_node, raw, "rust")
+    if len(leaves) <= 1 and "{" not in module_text and not inline_depth:
+        return [_generic_import(stmt_node, module_text, raw, "rust", src)]
+    imports = []
+    for path, local, exported in leaves:
+        path = _strip_inline_super(path, inline_depth)
+        imports.append(
+            Import(
+                raw_statement=raw,
+                module_path=path,
+                imported_names=[local],
+                is_relative=path.startswith(("self::", "super::", "crate::")),
+                resolved_file=None,
+                bindings=[NamedBinding(local_name=local, exported_name=exported, source_file=None)],
+                is_reexport=is_reexport,
+            )
+        )
+    return imports
+
+
+def _rust_inline_mod_depth(node: Node) -> int:
+    """How many inline ``mod name { ... }`` blocks enclose *node* in its file."""
+    depth = 0
+    parent = node.parent
+    while parent is not None:
+        if parent.type == "mod_item":
+            depth += 1
+        parent = parent.parent
+    return depth
+
+
+def _strip_inline_super(path: str, inline_depth: int) -> str:
+    """Drop the ``super`` hops of *path* that stay inside the file.
+
+    In ``mod tests { use super::*; }`` the ``super`` is this file's own
+    module, so the path is ``self::*``, not the parent module's glob.
+    """
+    if not inline_depth:
+        return path
+    segments = path.split("::")
+    hops = 0
+    while hops < len(segments) and segments[hops] == "super":
+        hops += 1
+    if not hops:
+        return path
+    if hops <= inline_depth:
+        return "::".join(["self", *segments[hops:]])
+    return "::".join(segments[inline_depth:])
 
 
 def _rust_mod_path_attribute(stmt_node: Node, src: str) -> str | None:
