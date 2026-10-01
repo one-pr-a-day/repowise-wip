@@ -1000,11 +1000,24 @@ class CallResolver(LanguageStrategiesMixin, ReceiverTypingMixin):
                 hits[hit.callee_id] = hit
         if hits:
             return True, next(iter(hits.values())) if len(hits) == 1 else None
-        # Proven only for a type whose members were all asked: a name the
-        # repository does not declare may be a type parameter (``TBuilder``),
-        # whose members are its constraint's.
-        known = type_id is not None or id_segment_name(type_name) in get_builtin_types("csharp")
+        # Proven only for a type whose members were all asked: one whose every
+        # base is a repository type, or a builtin. A name the repository does
+        # not declare may be a type parameter (``TBuilder``), whose members are
+        # its constraint's.
+        known = (
+            self._lineage_is_in_repo(type_id)
+            if type_id is not None
+            else id_segment_name(type_name) in get_builtin_types("csharp")
+        )
         return known and call.target_name not in self._unindexed_extension_names(), None
+
+    def _lineage_is_in_repo(self, class_id: str) -> bool:
+        """Does every base of *class_id* and of its ancestors resolve to a repository type?"""
+        for type_id in (class_id, *self._ancestors_of(class_id)):
+            bases = self._declared_bases(type_id)
+            if bases is None or any(base.startswith(_EXTERNAL_PREFIX) for base in bases):
+                return False
+        return True
 
     def _csharp_type_id(self, type_name: str) -> str | None:
         """The one C# type *type_name* (``IFoo`1`` or ``IFoo``) names repo-wide, or None."""
@@ -1139,14 +1152,12 @@ class CallResolver(LanguageStrategiesMixin, ReceiverTypingMixin):
         symbol_path = self._symbol_paths_by_id.get(callee_id)
         if symbol_path is None:
             return None
-        overload_key = (
-            symbol_path,
-            symbol.parent_name,
-            symbol.name,
-            argument_count,
-        )
-        if len(self._overload_return_types.get(overload_key, ())) > 1:
-            return None
+        # Overloads the arguments may mean, and declarations sharing this id
+        # (an extension is called one argument short of its parameters).
+        for count in {argument_count, signature_parameter_count(symbol.signature or "")}:
+            key = (symbol_path, symbol.parent_name, symbol.name, count)
+            if len(self._overload_return_types.get(key, ())) > 1:
+                return None
         return type_name
 
     def _return_typed_call(self, caller_id: str, sym_id: str, tier: str, line: int) -> ResolvedCall:

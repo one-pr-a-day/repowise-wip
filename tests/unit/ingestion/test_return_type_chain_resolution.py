@@ -567,6 +567,22 @@ def test_csharp_chain_on_a_repository_type_without_the_member_refuses(tmp_path: 
     assert ("When", 2) not in edges
 
 
+def test_csharp_chain_on_a_type_with_an_external_base_keeps_the_fallback(tmp_path: Path) -> None:
+    """The external base may declare the member, so nothing is proven."""
+    edges = _csharp_chain_edges(
+        tmp_path,
+        "Plain.Make().Flush();",
+        {
+            "Plain.cs": (
+                "public class Plain : Stream { public static Plain Make() { return null; } }\n"
+                "public class Sink { public void Flush() {} }\n"
+            )
+        },
+    )
+
+    assert edges[("Flush", 0)][0] == "Plain.cs::Sink::Flush"
+
+
 def test_csharp_chain_on_a_builtin_type_refuses(tmp_path: Path) -> None:
     edges = _csharp_chain_edges(
         tmp_path,
@@ -608,3 +624,26 @@ def test_csharp_chain_links_that_name_each_other_end_unresolved(tmp_path: Path) 
     edges = _csharp_chain_edges(tmp_path, "var a = First().Second(); var b = Second().First();")
 
     assert edges == {}
+
+
+def test_csharp_chain_link_whose_declarations_disagree_has_no_type(tmp_path: Path) -> None:
+    """Two same-arity `Then` overloads share one id but return different types.
+
+    Neither return type is the link's, so the next link is not refused on
+    whichever declaration the id happened to keep.
+    """
+    edges = _csharp_chain_edges(
+        tmp_path,
+        'RuleFor(x => x.Text).Must(t => true).Then(1).WithMessage("m");',
+        {
+            "Steps.cs": (
+                "public static class Steps {\n"
+                "  public static IRuleBuilderOptions<T, P> Then<T, P>"
+                "(this IRuleBuilderOptions<T, P> rule, int n) { return rule; }\n"
+                "  public static IRuleBuilderInitial<T, P> Then<T, P>"
+                "(this IRuleBuilderInitial<T, P> rule, int n) { return rule; }\n}\n"
+            )
+        },
+    )
+
+    assert ("WithMessage", 1) in edges
