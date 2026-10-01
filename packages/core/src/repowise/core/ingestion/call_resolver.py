@@ -196,7 +196,7 @@ def _has_internal_linkage(path: str, sym: Symbol) -> bool:
     so only a source file keeps the symbol to itself.
     """
     return (
-        sym.language in ("c", "cpp")
+        sym.language in ("c", "cpp", "objectivec")
         and sym.parent_name is None
         and sym.visibility == "private"
         and path.lower().endswith(_SOURCE_TU_EXTS)

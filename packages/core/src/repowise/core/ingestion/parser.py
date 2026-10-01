@@ -854,8 +854,10 @@ def _refine_visibility(
     """``(visibility, is_exported_symbol)`` after the language's AST-context rules."""
     # C/C++ visibility is dictated by AST context (access
     # specifiers / storage class / export attributes), not by
-    # modifier text. Refine after the generic fn ran.
-    if language in ("cpp", "c"):
+    # modifier text. Refine after the generic fn ran. Objective-C's
+    # grammar is a superset of C's, so the same shapes apply to
+    # plain C code inside a ``.m`` file.
+    if language in ("cpp", "c", "objectivec"):
         return refine_cpp_visibility(def_node, visibility, src)
     # C#: an unmodified declaration's default depends on what encloses
     # it, which the modifier-text fn cannot see.
