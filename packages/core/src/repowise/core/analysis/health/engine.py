@@ -124,6 +124,13 @@ log = structlog.get_logger(__name__)
 # ``code_origin``. Complexity findings copy ``dispatch_share`` into their
 # details and findings on a deprecated function gain ``deprecated: true``. No
 # CCN, threshold, weight or score moves.
+# v37 (also): a perf hit inside a lambda with no named function around it is
+# named for that lambda (``build``, ``it callback``), so its stored
+# ``function_name`` and public id change; top-level script code still carries
+# none. The v3 performance model also keys one opportunity per intervention, so
+# every stored opportunity id and the id stamped on every perf finding change.
+# ``lazy_load_in_loop`` findings carry ``details["orm"]``, which moves their
+# public ids and, for Django, their performance weight (0.4 -> 0.7).
 #
 # v36 (also): which files are tests changed (``repowise.core.test_paths``).
 # Compound directories headed by a test word (``e2e-tests/``, ``pkg_tests/``,
@@ -140,12 +147,6 @@ log = structlog.get_logger(__name__)
 # ``with atomic(), pytest.raises(E):`` counted one. Each item is classified now,
 # and a declining call's arguments are not scanned, so an assertion passed as an
 # argument still does not stand in for the header's oracle.
-#
-# v37: a perf hit inside a lambda with no named function around it is named for
-# that lambda (``build``, ``it callback``), so its stored ``function_name`` and
-# public id change; top-level script code still carries none. It also carries
-# ``PERFORMANCE_MODEL_VERSION`` 3 (one opportunity per intervention), so every
-# stored opportunity id and the id stamped on every perf finding change.
 #
 # v36: files a package manifest declares (package.json ``bin``, a built
 # ``main`` mapped to its source, a distribution's package ``__init__``) are
