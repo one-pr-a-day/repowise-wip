@@ -1245,10 +1245,14 @@ class DeadCodeAnalyzer:
         # A dynamic-use or framework edge means the runtime reaches any public
         # member of the file. Only these two: ``dynamic_imports`` means the
         # module is loaded, which a plain import edge does not rescue either.
+        # A framework edge that names its exports (a Lambda handler) rescues
+        # only those, through the importer check below.
         if any(
-            self.graph.get_edge_data(pred, node, {}).get("edge_type")
-            in ("dynamic_uses", "framework")
-            for pred in self.graph.predecessors(node)
+            edge.get("edge_type") in ("dynamic_uses", "framework")
+            and not edge.get("imported_names")
+            for edge in (
+                self.graph.get_edge_data(pred, node, {}) for pred in self.graph.predecessors(node)
+            )
         ):
             return None
 
