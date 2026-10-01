@@ -37,6 +37,8 @@ provider:
 functions:
   main:
     handler: app.handlers.lambda_handler
+  package:
+    handler: tasks.worker.process
 """
 
 _SAM_TEMPLATE = """\
@@ -188,6 +190,8 @@ _APP = {
         "def unused_py():\n    return 2\n"
     ),
     "py-svc/app/jobs.py": "from app.handlers import shared\n\n\ndef run():\n    return shared(1)\n",
+    "py-svc/tasks/__init__.py": "",
+    "py-svc/tasks/worker/__init__.py": "def process(event, context):\n    return event\n",
     "sam-app/template.yaml": _SAM_TEMPLATE,
     "sam-app/src/index.mjs": "export const handler = async (e) => e;\n",
     "sam-app/functions/app.mjs": (
@@ -279,6 +283,14 @@ def test_python_handler_by_dotted_module(tmp_path: Path) -> None:
     assert binds["edge_type"] == "framework_binds"
     assert ("unused_export", "py-svc/app/handlers.py", "lambda_handler") not in dead
     assert ("unused_export", "py-svc/app/handlers.py", "unused_py") in dead
+
+
+def test_python_handler_in_a_package_init(tmp_path: Path) -> None:
+    graph, _dead = _graph(_write(tmp_path, _APP))
+    target = "py-svc/tasks/worker/__init__.py"
+    assert _framework_names(graph, "py-svc/serverless.yml", target) == ["process"]
+    binds = graph.get_edge_data("py-svc/serverless.yml::__module__", f"{target}::process")
+    assert binds["edge_type"] == "framework_binds"
 
 
 def test_sam_code_uri_and_globals(tmp_path: Path) -> None:

@@ -105,7 +105,8 @@ def _handler_file(
             stem = posixpath.normpath(posixpath.join(base, code_dir, spelling))
             if stem.startswith(".."):
                 continue
-            for suffix in SOURCE_SUFFIXES:
+            # A Python package imports as its ``__init__.py``.
+            for suffix in (*SOURCE_SUFFIXES, "/__init__.py"):
                 if stem + suffix in path_set:
                     return stem + suffix
     return None
