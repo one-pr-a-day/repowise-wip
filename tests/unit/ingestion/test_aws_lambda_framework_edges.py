@@ -1,4 +1,4 @@
-"""AWS Lambda handlers named in serverless.yml and SAM templates as graph edges.
+"""AWS Lambda handlers named in serverless.yml, SAM templates and Terraform as graph edges.
 
 The cases go through traverse -> parse -> graph -> framework edges -> dead code,
 the path a real index takes.
@@ -67,6 +67,106 @@ Resources:
     Type: AWS::DynamoDB::Table
 """
 
+_TF_ARCHIVE_DIR = """\
+data "archive_file" "broker" {
+  type        = "zip"
+  source_dir  = "${path.module}/../lambda"
+  output_path = "${path.module}/broker.zip"
+}
+
+resource "aws_lambda_function" "broker" {
+  function_name = "broker"
+  filename      = data.archive_file.broker.output_path
+  handler       = "broker.handler" # the export AWS invokes
+  runtime       = "nodejs20.x"
+  environment {
+    variables = { MODE = "${var.mode}" }
+  }
+}
+"""
+
+# The archive is declared in one file and used in another, as Terraform allows.
+_TF_ARCHIVE_FILE_DATA = """\
+data "archive_file" "fn" {
+  type        = "zip"
+  source_file = "${path.module}/example_lambda.js"
+  output_path = "${path.module}/example_lambda.js.zip"
+}
+"""
+_TF_ARCHIVE_FILE_FN = """\
+resource "aws_lambda_function" "fn" {
+  filename = "${data.archive_file.fn.output_path}"
+  handler  = "example_lambda.handler"
+  assume_role_policy = <<EOF
+{ "Version": "2012-10-17" }
+EOF
+}
+"""
+
+# A path Terraform resolves from the working directory, not the module.
+_TF_WORKDIR_RELATIVE = """\
+data "archive_file" "zip" {
+  source_file = "lambda/function_src/index.js"
+  output_path = "lambda/function_src/index.zip"
+}
+resource "aws_lambda_function" "fn" {
+  filename = data.archive_file.zip.output_path
+  handler  = "index.main"
+}
+"""
+
+_TF_PREBUILT_ZIPS = """\
+resource "aws_lambda_function" "worker" {
+  filename = "artifacts/worker.zip"
+  handler  = "worker.run"
+}
+resource "aws_lambda_function" "report" {
+  s3_bucket = "artifacts"
+  s3_key    = "report.zip"
+  handler   = "app.report"
+}
+"""
+
+_TF_MODULES = """\
+module "one" {
+  source      = "terraform-aws-modules/lambda/aws"
+  handler     = "index.lambda_handler"
+  source_path = "../src/fn1"
+}
+module "two" {
+  source  = "terraform-aws-modules/lambda/aws"
+  handler = "app.handle"
+  source_path = [
+    {
+      path             = "${path.module}/../src/fn2"
+      pip_requirements = true
+    }
+  ]
+}
+"""
+
+_TF_UNRESOLVABLE = """\
+resource "aws_lambda_function" "from_var" {
+  filename = data.archive_file.missing.output_path
+  handler  = var.handler
+}
+resource "aws_lambda_function" "missing_archive" {
+  filename = data.archive_file.missing.output_path
+  handler  = "broker.handler"
+}
+resource "aws_lambda_function" "no_such_export" {
+  filename = "../lambda.zip"
+  handler  = "broker.doesNotExist"
+}
+module "not_a_lambda" {
+  source  = "./whatever"
+  handler = "broker.handler"
+}
+# resource "aws_lambda_function" "commented" {
+#   handler = "broker.handler"
+# }
+"""
+
 _APP = {
     "node-svc/serverless.yml": _SERVERLESS_NODE,
     "node-svc/src/handlers/users.mjs": (
@@ -94,6 +194,25 @@ _APP = {
         "export const lambdaHandler = async (e) => e;\nexport const helper = (x) => x;\n"
     ),
     "sam-app/functions/use.mjs": "import { helper } from './app.mjs';\nexport const u = helper(1);\n",
+    "tf-a/infra/lambda.tf": _TF_ARCHIVE_DIR,
+    "tf-a/lambda/broker.mjs": (
+        "export const handler = async () => 1;\nexport const stale = () => 2;\n"
+    ),
+    "tf-b/data.tf": _TF_ARCHIVE_FILE_DATA,
+    "tf-b/lambda.tf": _TF_ARCHIVE_FILE_FN,
+    "tf-b/example_lambda.js": "exports.handler = async (event) => event;\n",
+    "tf-c/iac/lambda/lambda.tf": _TF_WORKDIR_RELATIVE,
+    "tf-c/iac/lambda/function_src/index.js": "exports.main = async () => 1;\n",
+    "tf-d/main.tf": _TF_PREBUILT_ZIPS,
+    "tf-d/artifacts/worker/worker.py": "def run(event, context):\n    return event\n",
+    "tf-d/report/app.py": "def report(event, context):\n    return event\n",
+    "tf-e/infra/main.tf": _TF_MODULES,
+    "tf-e/src/fn1/index.py": (
+        "def lambda_handler(event, context):\n    return 1\n\n\ndef orphan_py():\n    return 2\n"
+    ),
+    "tf-e/src/fn2/app.py": "def handle(event, context):\n    return 1\n",
+    "tf-f/infra/bad.tf": _TF_UNRESOLVABLE,
+    "tf-f/lambda/broker.mjs": "export const handler = async () => 1;\n",
     # Not a mapping and not valid YAML: both must be skipped quietly.
     "broken/serverless.yml": "functions: [unclosed\n",
     "list/template.yml": "- just\n- a list\n",
@@ -194,3 +313,46 @@ def test_unresolvable_handlers_add_nothing(tmp_path: Path) -> None:
     # Invalid YAML and a top-level list are skipped without raising.
     assert _lambda_targets(graph, "broken/serverless.yml") == set()
     assert _lambda_targets(graph, "list/template.yml") == set()
+
+
+def test_terraform_archive_source_dir(tmp_path: Path) -> None:
+    graph, dead = _graph(_write(tmp_path, _APP))
+    assert _framework_names(graph, "tf-a/infra/lambda.tf", "tf-a/lambda/broker.mjs") == ["handler"]
+    binds = graph.get_edge_data("tf-a/infra/lambda.tf::__module__", "tf-a/lambda/broker.mjs::handler")
+    assert binds["edge_type"] == "framework_binds"
+    assert ("unused_export", "tf-a/lambda/broker.mjs", "handler") not in dead
+    assert ("unused_export", "tf-a/lambda/broker.mjs", "stale") in dead
+
+
+def test_terraform_archive_source_file_across_files(tmp_path: Path) -> None:
+    graph, dead = _graph(_write(tmp_path, _APP))
+    assert _framework_names(graph, "tf-b/lambda.tf", "tf-b/example_lambda.js") == ["handler"]
+    assert ("unreachable_file", "tf-b/example_lambda.js", "") not in dead
+
+
+def test_terraform_path_relative_to_working_directory(tmp_path: Path) -> None:
+    graph, _dead = _graph(_write(tmp_path, _APP))
+    target = "tf-c/iac/lambda/function_src/index.js"
+    assert _framework_names(graph, "tf-c/iac/lambda/lambda.tf", target) == ["main"]
+
+
+def test_terraform_prebuilt_zip_and_s3_key(tmp_path: Path) -> None:
+    graph, _dead = _graph(_write(tmp_path, _APP))
+    assert _framework_names(graph, "tf-d/main.tf", "tf-d/artifacts/worker/worker.py") == ["run"]
+    assert _framework_names(graph, "tf-d/main.tf", "tf-d/report/app.py") == ["report"]
+
+
+def test_terraform_lambda_module_source_path(tmp_path: Path) -> None:
+    graph, dead = _graph(_write(tmp_path, _APP))
+    assert _framework_names(graph, "tf-e/infra/main.tf", "tf-e/src/fn1/index.py") == [
+        "lambda_handler"
+    ]
+    assert _framework_names(graph, "tf-e/infra/main.tf", "tf-e/src/fn2/app.py") == ["handle"]
+    assert ("unused_export", "tf-e/src/fn1/index.py", "orphan_py") in dead
+
+
+def test_terraform_unresolvable_handlers_add_nothing(tmp_path: Path) -> None:
+    graph, _dead = _graph(_write(tmp_path, _APP))
+    # A variable, a missing archive, an export the file lacks, a module that is
+    # not a Lambda and a commented-out block.
+    assert _lambda_targets(graph, "tf-f/infra/bad.tf") == set()
